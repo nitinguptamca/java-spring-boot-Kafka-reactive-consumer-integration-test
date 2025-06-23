@@ -1,0 +1,82 @@
+package com.example;
+
+import com.example.avro.User;
+import com.example.listener.UserKafkaListener;
+import io.confluent.kafka.schemaregistry.client.MockSchemaRegistryClient;
+import io.confluent.kafka.schemaregistry.client.SchemaRegistryClient;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.test.context.EmbeddedKafka;
+import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.TestPropertySource;
+
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@SpringBootTest
+@EmbeddedKafka(partitions = 1, topics = {"users-topic"}, brokerProperties = {"listeners=PLAINTEXT://localhost:9092", "port=9092"})
+@TestPropertySource(properties = {
+        "spring.kafka.bootstrap-servers=${spring.embedded.kafka.brokers}",
+        "spring.kafka.producer.value-serializer=io.confluent.kafka.serializers.KafkaAvroSerializer",
+        "spring.kafka.consumer.value-deserializer=io.confluent.kafka.serializers.KafkaAvroDeserializer",
+        "spring.kafka.properties.schema.registry.url=mock://test-scope", // Use mock schema registry
+        "spring.kafka.consumer.group-id=test-group"
+})
+@ActiveProfiles("test")
+@DirtiesContext
+class KafkaAvroIntegrationTestApplicationTests {
+
+    // Inject KafkaTemplate directly
+    @Autowired
+    private KafkaTemplate<String, User> kafkaTemplate;
+
+    @Autowired
+    private UserKafkaListener userKafkaListener;
+
+    private static final String TOPIC = "users-topic";
+
+    @BeforeEach
+    void setUp() {
+        userKafkaListener.getReceivedUsers().clear();
+        userKafkaListener.resetLatch(1);
+    }
+
+    @Test
+    void testProduceAndConsumeAvroUserDirectlyWithKafkaTemplate() throws InterruptedException {
+        // Given
+        User user = new User("123", "John Doe", "john.doe@example.com");
+
+        // When
+        // Use kafkaTemplate directly to send the message
+        kafkaTemplate.send(TOPIC, user.getId(), user);
+        System.out.println("Sent user: " + user.getName() + " directly via KafkaTemplate to topic: " + TOPIC);
+
+        // Then
+        // Wait for the consumer to receive the message
+        boolean messageReceived = userKafkaListener.getLatch().await(10, TimeUnit.SECONDS);
+        assertThat(messageReceived).isTrue();
+
+        List<User> receivedUsers = userKafkaListener.getReceivedUsers();
+        assertThat(receivedUsers).hasSize(1);
+        assertThat(receivedUsers.get(0)).isEqualTo(user);
+    }
+
+    // Configuration for MockSchemaRegistryClient for tests
+    @Configuration
+    static class TestConfig {
+        @Bean
+        @Primary
+        public SchemaRegistryClient schemaRegistryClient() {
+            return new MockSchemaRegistryClient();
+        }
+    }
+}
