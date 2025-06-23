@@ -1,0 +1,75 @@
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.listener.ContainerProperties;
+import org.springframework.kafka.listener.KafkaMessageListenerContainer;
+import org.springframework.kafka.listener.MessageListener;
+import org.springframework.kafka.test.EmbeddedKafkaBroker;
+import org.springframework.kafka.test.context.EmbeddedKafka;
+import org.springframework.kafka.test.utils.ContainerTestUtils;
+import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.ActiveProfiles;
+
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@SpringBootTest
+@DirtiesContext
+@EmbeddedKafka(partitions = 1, brokerProperties = { "listeners=PLAINTEXT://localhost:9092", "port=9092" }) // Adjust port if needed
+@ActiveProfiles("test") // Use a test profile for specific configurations
+public class AvroKafkaIntegrationTest {
+
+    private static final String TOPIC = "my-avro-topic";
+
+    @Autowired
+    private EmbeddedKafkaBroker embeddedKafkaBroker;
+
+    @Autowired
+    private KafkaTemplate<String, MyAvroRecord> kafkaTemplate; // Assuming MyAvroRecord is your Avro generated class
+
+    private KafkaMessageListenerContainer<String, MyAvroRecord> container;
+    private BlockingQueue<ConsumerRecord<String, MyAvroRecord>> records;
+
+    @BeforeEach
+    void setUp() {
+        // Configure and start a consumer for testing
+        ContainerProperties containerProperties = new ContainerProperties(TOPIC);
+        containerProperties.setGroupId("test-group");
+        containerProperties.setPollTimeout(100);
+
+        // Assuming you have a ConsumerFactory configured for Avro deserialization in your test profile
+        container = new KafkaMessageListenerContainer<>(
+                embeddedKafkaBroker.getConsumerFactory(), containerProperties);
+        records = new LinkedBlockingQueue<>();
+        container.setupMessageListener((MessageListener<String, MyAvroRecord>) records::add);
+        container.start();
+        ContainerTestUtils.waitForAssignment(container, embeddedKafkaBroker.getPartitionsPerTopic());
+    }
+
+    @Test
+    void testAvroMessageSerializationAndDeserialization() throws InterruptedException {
+        // Create an Avro record instance
+        MyAvroRecord avroRecord = new MyAvroRecord("testId", "testName"); // Example constructor
+
+        // Send the Avro record to Kafka
+        kafkaTemplate.send(TOPIC, "key", avroRecord);
+
+        // Verify the message is consumed
+        ConsumerRecord<String, MyAvroRecord> received = records.poll(10, TimeUnit.SECONDS);
+
+        assertThat(received).isNotNull();
+        assertThat(received.key()).isEqualTo("key");
+        assertThat(received.value()).isInstanceOf(MyAvroRecord.class);
+        assertThat(received.value().getId()).isEqualTo("testId");
+        assertThat(received.value().getName()).isEqualTo("testName");
+    }
+
+    // You might need a @AfterEach to stop the container if not handled by @DirtiesContext
+}
