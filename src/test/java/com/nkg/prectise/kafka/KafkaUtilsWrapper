@@ -1,0 +1,51 @@
+import java.lang.reflect.Method;
+import java.util.Collection;
+import java.util.Iterator;
+
+public class KafkaUtilsWrapper {
+
+    public static String safeJoin(Collection<?> collection, String delimiter) {
+        try {
+            // Try to find the original method first (if it exists in the runtime JAR)
+            Class<?> utilsClass = Class.forName("org.apache.kafka.common.utils.Utils");
+            Method joinMethod = utilsClass.getMethod("join", Collection.class, String.class);
+            // If found, invoke it
+            return (String) joinMethod.invoke(null, collection, delimiter); // static method, so 'null' for instance
+        } catch (NoSuchMethodException e) {
+            // The method doesn't exist, fall back to our own implementation
+            System.err.println("Warning: org.apache.kafka.common.utils.Utils.join(Collection, String) not found. Using fallback implementation.");
+            return customJoin(collection, delimiter);
+        } catch (Exception e) {
+            // Handle other reflection exceptions (IllegalAccessException, InvocationTargetException)
+            System.err.println("Error invoking Kafka Utils.join via reflection. Using fallback. " + e.getMessage());
+            return customJoin(collection, delimiter);
+        }
+    }
+
+    // Your custom implementation of the join logic
+    private static String customJoin(Collection<?> collection, String delimiter) {
+        if (collection == null || collection.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        Iterator<?> it = collection.iterator();
+        while (it.hasNext()) {
+            sb.append(it.next().toString());
+            if (it.hasNext()) {
+                sb.append(delimiter);
+            }
+        }
+        return sb.toString();
+    }
+
+    public static void main(String[] args) {
+        // Example usage:
+        java.util.List<String> items = java.util.Arrays.asList("item1", "item2", "item3");
+        String result = safeJoin(items, ", ");
+        System.out.println("Joined string: " + result);
+
+        // To simulate the NoSuchMethodError, you'd need to run this with a Kafka client JAR
+        // that *doesn't* have the method.
+        // If it *does* have the method, it will use the reflection call.
+    }
+}
