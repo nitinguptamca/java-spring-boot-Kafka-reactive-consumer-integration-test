@@ -1,0 +1,32 @@
+import java.util.Collection;
+import java.util.Iterator;
+
+public class MyProjectUtils {
+
+    /**
+     * Replaces calls to org.apache.kafka.common.utils.Utils.join(Collection, String)
+     * due to potential NoSuchMethodError caused by Kafka dependency conflicts.
+     */
+    public static String join(Collection<?> collection, String delimiter) {
+        if (collection == null || collection.isEmpty()) {
+            return "";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        Iterator<?> it = collection.iterator();
+        while (it.hasNext()) {
+            sb.append(it.next().toString());
+            if (it.hasNext()) {
+                sb.append(delimiter);
+            }
+        }
+        return sb.toString();
+    }
+
+    // Example usage in your Kafka-related code:
+    public void processKafkaData(Collection<String> items) {
+        String joinedItems = MyProjectUtils.join(items, ", ");
+        System.out.println("Processing: " + joinedItems);
+        // ... rest of your Kafka logic
+    }
+}
