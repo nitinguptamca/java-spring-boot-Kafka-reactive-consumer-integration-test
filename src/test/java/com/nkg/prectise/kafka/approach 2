@@ -1,0 +1,193 @@
+#
+# Databricks Spark ETL Script for Large CSV Processing
+#
+# This script processes a large 1GB CSV file from Azure Data Lake, enriches it
+# with data from MongoDB, handles errors, and prepares the output for an event queue.
+# It is designed to be run in a Databricks notebook.
+#
+# Prerequisites:
+# 1. Ensure the 'pymongo' library is installed in your Databricks cluster.
+# 2. Configure the necessary secrets for database and storage connections.
+#
+
+import json
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf, lit
+from pyspark.sql.types import StructType, StructField, StringType, BooleanType, IntegerType, ArrayType
+from pymongo import MongoClient
+
+# --- 0. Configuration ---
+# Replace with your actual paths, connection strings, and event hub details
+ADLS_CSV_PATH = "abfss://your-container@your-datalake.dfs.core.windows.net/path/to/your/large_file.csv"
+ADLS_ERROR_PATH = "abfss://your-container@your-datalake.dfs.core.windows.net/path/to/errors/"
+MONGODB_CONN_STRING = "mongodb://your_mongo_user:your_mongo_password@your_mongo_host:27017/?authSource=admin"
+DB_NAME = "your_database_name"
+PAYLOAD_COLLECTION = "payload"
+ACKNOWLEDGE_COLLECTION = "acknowledge"
+
+# Assume a simple schema for the CSV. Adjust this to your actual file structure.
+# It is crucial to define the schema for performance with large files.
+schema = StructType([
+    StructField("message_id", StringType(), True),
+    StructField("message-seq-id", StringType(), True),
+    StructField("schema_type", StringType(), True),
+    StructField("data_content", StringType(), True)
+    # Add other fields as needed
+])
+
+# --- 1. Spark Session Initialization ---
+spark = SparkSession.builder.appName("DataLakeProcessor").getOrCreate()
+spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+spark.conf.set("spark.sql.adaptive.enabled", "true") # Enable adaptive query execution for performance
+
+print("Spark session initialized successfully.")
+
+# --- 2. UDF for MongoDB Lookup (Step 2) ---
+# This UDF will be applied to each row of the DataFrame in parallel.
+# It connects to MongoDB, performs the required lookups, and returns a JSON string
+# containing the updated headers and a status flag.
+def check_reprocessing_flags(message_id):
+    """
+    Connects to MongoDB and checks for the presence of a message_id
+    in the payload and acknowledge collections.
+    Returns a JSON string with the reprocessing flags.
+    """
+    # Use a try-except block to handle potential connection or query errors gracefully
+    try:
+        client = MongoClient(MONGODB_CONN_STRING)
+        db = client[DB_NAME]
+
+        # Check for message_id in the 'payload' collection
+        payload_record = db[PAYLOAD_COLLECTION].find_one({"message_id": message_id})
+        peh_reprocessing_required = payload_record is None
+
+        # Check for message_id in the 'acknowledge' collection
+        acknowledge_record = db[ACKNOWLEDGE_COLLECTION].find_one({"message_id": message_id})
+        apid_reprocessing_required = acknowledge_record is None
+
+        client.close()
+
+        result = {
+            "PehReprocessingRequired": peh_reprocessing_required,
+            "APIDReprocessingRequired": apid_reprocessing_required,
+            "status": "success",
+            "error_details": None
+        }
+        return json.dumps(result)
+
+    except Exception as e:
+        error_result = {
+            "PehReprocessingRequired": True,
+            "APIDReprocessingRequired": True,
+            "status": "error",
+            "error_details": str(e)
+        }
+        return json.dumps(error_result)
+
+# Register the UDF with Spark. The return type is StringType as we return a JSON string.
+mongo_lookup_udf = udf(check_reprocessing_flags, StringType())
+
+# --- 3. Main Processing Logic ---
+try:
+    # Step 1: Read the large CSV file into a DataFrame.
+    # Using 'header=True' and a predefined schema is efficient.
+    df = spark.read.csv(
+        ADLS_CSV_PATH,
+        header=True,
+        schema=schema,
+        sep=",",
+        multiLine=True
+    )
+    print(f"Successfully loaded {df.count()} records from CSV file.")
+    df.printSchema()
+
+    # Apply the UDF to the DataFrame to get the reprocessing flags
+    # We create a new column 'reprocessing_flags' to hold the JSON string
+    df_with_flags = df.withColumn("reprocessing_flags", mongo_lookup_udf(df["message_id"]))
+
+    # Parse the JSON string from the UDF output and add new columns
+    # This avoids multiple UDF calls and keeps the logic clean.
+    df_enriched = df_with_flags.withColumn(
+        "PehReprocessingRequired",
+        df_with_flags["reprocessing_flags"].substr(
+            df_with_flags["reprocessing_flags"].find("PehReprocessingRequired") + 28, 5
+        ) == "false"
+    ).withColumn(
+        "APIDReprocessingRequired",
+        df_with_flags["reprocessing_flags"].substr(
+            df_with_flags["reprocessing_flags"].find("APIDReprocessingRequired") + 29, 5
+        ) == "false"
+    ).withColumn(
+        "processing_status",
+        df_with_flags["reprocessing_flags"].substr(
+            df_with_flags["reprocessing_flags"].find("status") + 9, 7
+        )
+    ).withColumn(
+        "error_details",
+        df_with_flags["reprocessing_flags"].substr(
+            df_with_flags["reprocessing_flags"].find("error_details") + 16, 500
+        )
+    ).drop("reprocessing_flags")
+
+    # --- Step 3: Create Error File ---
+    # Filter the DataFrame to isolate records that encountered errors.
+    error_df = df_enriched.filter(df_enriched["processing_status"] == "error")
+
+    # Write the error records to a new location in ADLS.
+    # We use 'overwrite' mode for simplicity, but 'append' might be better for production.
+    if error_df.count() > 0:
+        error_df.write.mode("overwrite").csv(ADLS_ERROR_PATH, header=True)
+        print(f"Successfully wrote {error_df.count()} error records to {ADLS_ERROR_PATH}")
+    else:
+        print("No error records found. Skipping error file creation.")
+
+    # Get the successfully processed records
+    success_df = df_enriched.filter(df_enriched["processing_status"] == "success")
+
+    # --- Step 4: Prepare and Send Message to Reprocessing Event ---
+    # Define the final schema for the output message.
+    # We will create a JSON string for each row and then "send" it.
+    def prepare_event_message(row):
+        """
+        Formats a row into a JSON message with the required headers.
+        In a real-world scenario, this would send to an event hub.
+        """
+        # Build the message header
+        header = {
+            "message_id": row["message_id"],
+            "message-seq-id": row["message-seq-id"],
+            "schema_type": row["schema_type"],
+            "PehReprocessingRequired": row["PehReprocessingRequired"],
+            "APIDReprocessingRequired": row["APIDReprocessingRequired"],
+        }
+        # Assuming the 'data_content' field holds the actual message body
+        message_body = row["data_content"]
+
+        # This is where you would integrate with an Azure Event Hub client.
+        # For demonstration, we'll just print the final JSON string.
+        output_message = {
+            "header": header,
+            "body": json.loads(message_body) if message_body.startswith('{') else message_body
+        }
+        return json.dumps(output_message)
+
+    # Convert the DataFrame rows to the desired JSON message format.
+    # Using 'collect()' on a very large dataset is not recommended.
+    # A better approach is to write to an event hub directly from the RDD or iterate
+    # over partitions, but for this example, we'll show the message format.
+    # In a production environment, you would use a library like 'azure-eventhub'
+    # with a foreachPartition loop to send messages in batches.
+    print("\n--- Example of the final message format (showing first 5 messages) ---")
+    messages_to_send = success_df.limit(5).rdd.map(prepare_event_message).collect()
+    for msg in messages_to_send:
+        print(msg)
+        # Here you would call eventhub_client.send_event(msg)
+
+    print("\nProcessing complete.")
+
+except Exception as e:
+    print(f"An error occurred during processing: {e}")
+finally:
+    # Stop the Spark session to release resources
+    spark.stop()
+    print("Spark session stopped.")
